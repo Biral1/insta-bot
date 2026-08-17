@@ -22,7 +22,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Your Telegram admin ID
-ADMIN_ID = 1791464014
+ADMIN_ID = 1791464015
 
 
 # ============================================================
