@@ -1,4 +1,8 @@
 # Byte-compiled / optimized / DLL files
+.env
+cookies.txt
+*.mp4
+*.webm
 __pycache__/
 *.py[codz]
 *$py.class
