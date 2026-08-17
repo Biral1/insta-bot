@@ -8,42 +8,93 @@ import requests
 import yt_dlp
 
 from flask import Flask, request, jsonify
+from supabase import create_client
 
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-this-secret")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Your Telegram admin ID
+ADMIN_ID = 1791464014
+
+
+# ============================================================
+# VALIDATE ENVIRONMENT
+# ============================================================
+
+required_variables = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "WEBHOOK_SECRET": WEBHOOK_SECRET,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_KEY": SUPABASE_KEY,
+}
+
+missing = [
+    name
+    for name, value in required_variables.items()
+    if not value
+]
+
+if missing:
+    raise RuntimeError(
+        "Missing environment variables: "
+        + ", ".join(missing)
+    )
+
+
+# ============================================================
+# INITIALIZE
+# ============================================================
 
 app = Flask(__name__)
 
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --------------------------------------------------
-# Telegram helpers
-# --------------------------------------------------
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
 
 def telegram(method, data=None, files=None):
+
     url = f"{TELEGRAM_API}/{method}"
 
     response = requests.post(
         url,
         data=data,
         files=files,
-        timeout=60,
+        timeout=120,
     )
 
     response.raise_for_status()
-    return response.json()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram API error"
+            )
+        )
+
+    return result
 
 
 def send_message(chat_id, text):
+
     return telegram(
         "sendMessage",
         data={
@@ -53,22 +104,110 @@ def send_message(chat_id, text):
     )
 
 
-# --------------------------------------------------
-# Instagram URL detection
-# --------------------------------------------------
+# ============================================================
+# USER DATABASE
+# ============================================================
+
+def is_allowed(user_id):
+
+    # Admin is always allowed
+    if user_id == ADMIN_ID:
+        return True
+
+    try:
+
+        result = (
+            supabase
+            .table("allowed_users")
+            .select("telegram_id")
+            .eq("telegram_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        return bool(result.data)
+
+    except Exception as e:
+
+        print(
+            "DATABASE ERROR while checking user:",
+            repr(e)
+        )
+
+        # Fail closed:
+        # if database is unavailable, don't allow users.
+        return False
+
+
+def add_user(user_id):
+
+    result = (
+        supabase
+        .table("allowed_users")
+        .upsert({
+            "telegram_id": user_id
+        })
+        .execute()
+    )
+
+    return result
+
+
+def remove_user(user_id):
+
+    result = (
+        supabase
+        .table("allowed_users")
+        .delete()
+        .eq("telegram_id", user_id)
+        .execute()
+    )
+
+    return result
+
+
+def get_users():
+
+    result = (
+        supabase
+        .table("allowed_users")
+        .select("telegram_id, added_at")
+        .order("added_at", desc=False)
+        .execute()
+    )
+
+    return result.data or []
+
+
+# ============================================================
+# INSTAGRAM URL
+# ============================================================
 
 def is_instagram_url(text):
+
     if not text:
         return False
 
-    pattern = r"https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[^\s]+"
+    pattern = (
+        r"https?://"
+        r"(?:www\.)?"
+        r"instagram\.com/"
+        r"(?:reel|p|tv)/"
+        r"[^\s]+"
+    )
 
-    return bool(re.search(pattern, text, re.IGNORECASE))
+    return bool(
+        re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+    )
 
 
-# --------------------------------------------------
-# Download
-# --------------------------------------------------
+# ============================================================
+# INSTAGRAM DOWNLOAD
+# ============================================================
 
 def download_instagram(url, output_dir):
 
@@ -77,20 +216,19 @@ def download_instagram(url, output_dir):
     )
 
     options = {
+
         "outtmpl": output_template,
 
-        # Prefer MP4 when available
         "format": "bv*+ba/b",
 
         "merge_output_format": "mp4",
 
-        # Don't download playlists
         "noplaylist": True,
 
-        # Keep logs useful
         "quiet": True,
 
-        # Current yt-dlp option for Instagram
+        "no_warnings": True,
+
         "extractor_args": {
             "instagram": {
                 "skip": "dash"
@@ -100,43 +238,81 @@ def download_instagram(url, output_dir):
 
     # Optional Instagram cookies.
     #
-    # If you later upload a cookies.txt file to Render
-    # as a Secret File, this automatically uses it.
-    cookies_path = "/etc/secrets/instagram_cookies.txt"
+    # If we later upload a cookies file to Render
+    # as a Secret File, yt-dlp will automatically use it.
+
+    cookies_path = (
+        "/etc/secrets/instagram_cookies.txt"
+    )
 
     if os.path.exists(cookies_path):
+
+        print("Using Instagram cookies.")
+
         options["cookiefile"] = cookies_path
 
+    else:
+
+        print(
+            "No Instagram cookies file found."
+        )
+
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
 
-        downloaded = ydl.prepare_filename(info)
+        info = ydl.extract_info(
+            url,
+            download=True
+        )
 
-        # yt-dlp may change the extension after merging
-        base = Path(downloaded).with_suffix("")
+        downloaded = ydl.prepare_filename(
+            info
+        )
 
-        possible_files = list(Path(output_dir).glob(
-            base.name + ".*"
-        ))
+        downloaded_path = Path(
+            downloaded
+        )
 
-        if not possible_files:
+        # Look for the resulting file.
+        #
+        # yt-dlp may change the extension when
+        # merging video/audio.
+
+        candidates = list(
+            Path(output_dir).glob(
+                downloaded_path.stem + ".*"
+            )
+        )
+
+        if not candidates:
+
             raise FileNotFoundError(
-                "Downloaded file could not be located."
+                "Downloaded video could not be found."
             )
 
-        return possible_files[0]
+        # Prefer MP4
+        mp4_files = [
+            file
+            for file in candidates
+            if file.suffix.lower() == ".mp4"
+        ]
+
+        if mp4_files:
+            return mp4_files[0]
+
+        return candidates[0]
 
 
-# --------------------------------------------------
-# Process a download
-# --------------------------------------------------
+# ============================================================
+# DOWNLOAD PROCESS
+# ============================================================
 
-def process_download(chat_id, url):
+def process_download(chat_id, user_id, url):
 
     try:
+
         send_message(
             chat_id,
-            "⏳ Downloading your Instagram video..."
+            "⏳ Downloading Instagram video..."
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -146,28 +322,33 @@ def process_download(chat_id, url):
                 temp_dir
             )
 
-            file_size = video_file.stat().st_size
+            file_size = (
+                video_file.stat().st_size
+            )
 
-            # Telegram Bot API currently allows bot uploads
-            # of up to 50 MB for videos/documents.
+            # Telegram Bot API limit
+            # for this implementation.
             if file_size > 50 * 1024 * 1024:
 
                 send_message(
                     chat_id,
-                    "❌ The video is larger than Telegram's "
-                    "current 50 MB bot upload limit."
+                    "❌ The video is larger than "
+                    "Telegram's 50 MB bot upload limit."
                 )
 
                 return
 
             send_message(
                 chat_id,
-                "📤 Uploading video to Telegram..."
+                "📤 Uploading video..."
             )
 
-            with open(video_file, "rb") as video:
+            with open(
+                video_file,
+                "rb"
+            ) as video:
 
-                result = telegram(
+                telegram(
                     "sendVideo",
                     data={
                         "chat_id": chat_id,
@@ -178,11 +359,6 @@ def process_download(chat_id, url):
                     },
                 )
 
-            if not result.get("ok"):
-                raise RuntimeError(
-                    result.get("description", "Telegram error")
-                )
-
             send_message(
                 chat_id,
                 "✅ Done!"
@@ -190,32 +366,346 @@ def process_download(chat_id, url):
 
     except Exception as e:
 
-        print("DOWNLOAD ERROR:", repr(e))
+        print(
+            "DOWNLOAD ERROR:",
+            repr(e)
+        )
 
         send_message(
             chat_id,
             "❌ Download failed.\n\n"
-            "The Instagram post may require login, "
-            "be private, unavailable, or temporarily "
-            "blocked by Instagram."
+            "The Instagram video may be private, "
+            "require login, unavailable, or "
+            "temporarily blocked by Instagram."
         )
 
 
-# --------------------------------------------------
-# Telegram webhook
-# --------------------------------------------------
+# ============================================================
+# COMMANDS
+# ============================================================
+
+def handle_command(
+    chat_id,
+    user_id,
+    text
+):
+
+    command = text.strip()
+
+    # --------------------------------------------------------
+    # /start
+    # --------------------------------------------------------
+
+    if command == "/start":
+
+        if user_id == ADMIN_ID:
+
+            send_message(
+                chat_id,
+                "👋 Welcome, Admin!\n\n"
+                "Instagram Downloader is ready.\n\n"
+                "Admin commands:\n"
+                "/users\n"
+                "/adduser USER_ID\n"
+                "/removeuser USER_ID\n"
+                "/id"
+            )
+
+        elif is_allowed(user_id):
+
+            send_message(
+                chat_id,
+                "👋 Welcome!\n\n"
+                "Send me an Instagram Reel or "
+                "video URL."
+            )
+
+        else:
+
+            send_message(
+                chat_id,
+                "❌ You are not authorized "
+                "to use this bot."
+            )
+
+        return True
+
+    # --------------------------------------------------------
+    # /help
+    # --------------------------------------------------------
+
+    if command == "/help":
+
+        if user_id == ADMIN_ID:
+
+            send_message(
+                chat_id,
+                "👑 Admin commands:\n\n"
+                "/users - list allowed users\n"
+                "/adduser USER_ID - allow a user\n"
+                "/removeuser USER_ID - remove a user\n"
+                "/id - show your Telegram ID\n\n"
+                "You can also send an Instagram URL."
+            )
+
+        elif is_allowed(user_id):
+
+            send_message(
+                chat_id,
+                "Send me an Instagram Reel or "
+                "video URL."
+            )
+
+        else:
+
+            send_message(
+                chat_id,
+                "❌ You are not authorized "
+                "to use this bot."
+            )
+
+        return True
+
+    # --------------------------------------------------------
+    # /id
+    # --------------------------------------------------------
+
+    if command == "/id":
+
+        send_message(
+            chat_id,
+            f"Your Telegram ID is:\n{user_id}"
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # ADMIN: /users
+    # --------------------------------------------------------
+
+    if command == "/users":
+
+        if user_id != ADMIN_ID:
+
+            send_message(
+                chat_id,
+                "❌ Admin only."
+            )
+
+            return True
+
+        try:
+
+            users = get_users()
+
+            if not users:
+
+                send_message(
+                    chat_id,
+                    "👥 No users are currently allowed."
+                )
+
+                return True
+
+            lines = [
+                "👥 Allowed users:\n"
+            ]
+
+            for index, user in enumerate(
+                users,
+                start=1
+            ):
+
+                telegram_id = user[
+                    "telegram_id"
+                ]
+
+                lines.append(
+                    f"{index}. {telegram_id}"
+                )
+
+            lines.append(
+                f"\n👑 Admin: {ADMIN_ID}"
+            )
+
+            send_message(
+                chat_id,
+                "\n".join(lines)
+            )
+
+        except Exception as e:
+
+            print(
+                "USERS ERROR:",
+                repr(e)
+            )
+
+            send_message(
+                chat_id,
+                "❌ Could not read user database."
+            )
+
+        return True
+
+    # --------------------------------------------------------
+    # ADMIN: /adduser
+    # --------------------------------------------------------
+
+    if command.startswith("/adduser"):
+
+        if user_id != ADMIN_ID:
+
+            send_message(
+                chat_id,
+                "❌ Admin only."
+            )
+
+            return True
+
+        parts = command.split()
+
+        if len(parts) != 2:
+
+            send_message(
+                chat_id,
+                "Usage:\n"
+                "/adduser 123456789"
+            )
+
+            return True
+
+        try:
+
+            new_user_id = int(parts[1])
+
+            if new_user_id == ADMIN_ID:
+
+                send_message(
+                    chat_id,
+                    "ℹ️ You are already the admin."
+                )
+
+                return True
+
+            add_user(new_user_id)
+
+            send_message(
+                chat_id,
+                f"✅ User {new_user_id} added."
+            )
+
+        except ValueError:
+
+            send_message(
+                chat_id,
+                "❌ User ID must be a number."
+            )
+
+        except Exception as e:
+
+            print(
+                "ADD USER ERROR:",
+                repr(e)
+            )
+
+            send_message(
+                chat_id,
+                "❌ Could not add user."
+            )
+
+        return True
+
+    # --------------------------------------------------------
+    # ADMIN: /removeuser
+    # --------------------------------------------------------
+
+    if command.startswith("/removeuser"):
+
+        if user_id != ADMIN_ID:
+
+            send_message(
+                chat_id,
+                "❌ Admin only."
+            )
+
+            return True
+
+        parts = command.split()
+
+        if len(parts) != 2:
+
+            send_message(
+                chat_id,
+                "Usage:\n"
+                "/removeuser 123456789"
+            )
+
+            return True
+
+        try:
+
+            remove_id = int(parts[1])
+
+            if remove_id == ADMIN_ID:
+
+                send_message(
+                    chat_id,
+                    "❌ You cannot remove the admin."
+                )
+
+                return True
+
+            remove_user(remove_id)
+
+            send_message(
+                chat_id,
+                f"✅ User {remove_id} removed."
+            )
+
+        except ValueError:
+
+            send_message(
+                chat_id,
+                "❌ User ID must be a number."
+            )
+
+        except Exception as e:
+
+            print(
+                "REMOVE USER ERROR:",
+                repr(e)
+            )
+
+            send_message(
+                chat_id,
+                "❌ Could not remove user."
+            )
+
+        return True
+
+    return False
+
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
 
 @app.post("/webhook/<secret>")
 def webhook(secret):
 
+    # Verify webhook secret
     if secret != WEBHOOK_SECRET:
+
         return jsonify({
             "ok": False
         }), 403
 
-    update = request.get_json(silent=True)
+    update = request.get_json(
+        silent=True
+    )
 
     if not update:
+
         return jsonify({
             "ok": True
         })
@@ -223,54 +713,84 @@ def webhook(secret):
     message = update.get("message")
 
     if not message:
+
         return jsonify({
             "ok": True
         })
 
-    chat = message.get("chat", {})
+    chat = message.get(
+        "chat",
+        {}
+    )
+
     chat_id = chat.get("id")
 
-    text = message.get("text", "")
+    user = message.get(
+        "from",
+        {}
+    )
 
-    if not chat_id:
+    user_id = user.get("id")
+
+    text = message.get(
+        "text",
+        ""
+    ).strip()
+
+    if not chat_id or not user_id:
+
         return jsonify({
             "ok": True
         })
 
-    if text == "/start":
+    # --------------------------------------------------------
+    # Commands
+    # --------------------------------------------------------
+
+    if text.startswith("/"):
+
+        handled = handle_command(
+            chat_id,
+            user_id,
+            text
+        )
+
+        if handled:
+
+            return jsonify({
+                "ok": True
+            })
+
+    # --------------------------------------------------------
+    # Check authorization BEFORE downloading
+    # --------------------------------------------------------
+
+    if not is_allowed(user_id):
 
         send_message(
             chat_id,
-            "👋 Instagram Downloader\n\n"
-            "Send me an Instagram Reel or video URL."
+            "❌ You are not authorized "
+            "to use this bot."
         )
 
         return jsonify({
             "ok": True
         })
 
-    if text == "/help":
-
-        send_message(
-            chat_id,
-            "Send an Instagram Reel/video URL and "
-            "I'll try to download it.\n\n"
-            "Example:\n"
-            "https://www.instagram.com/reel/..."
-        )
-
-        return jsonify({
-            "ok": True
-        })
+    # --------------------------------------------------------
+    # Instagram URL
+    # --------------------------------------------------------
 
     if is_instagram_url(text):
 
-        # Start the download in the background so the
-        # Telegram webhook receives a quick HTTP response.
         thread = threading.Thread(
             target=process_download,
-            args=(chat_id, text),
-            daemon=True,
+            args=(
+                chat_id,
+                user_id,
+                text
+            ),
+            daemon=True
         )
 
         thread.start()
@@ -279,9 +799,13 @@ def webhook(secret):
             "ok": True
         })
 
+    # --------------------------------------------------------
+    # Unknown message
+    # --------------------------------------------------------
+
     send_message(
         chat_id,
-        "Please send a valid Instagram Reel/video URL."
+        "Please send an Instagram Reel/video URL."
     )
 
     return jsonify({
@@ -289,9 +813,9 @@ def webhook(secret):
     })
 
 
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 def home():
@@ -302,16 +826,21 @@ def home():
     })
 
 
-# --------------------------------------------------
-# Local development
-# --------------------------------------------------
+# ============================================================
+# RUN LOCALLY
+# ============================================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
         port=port,
-        debug=False,
+        debug=False
     )
